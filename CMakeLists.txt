@@ -38,7 +38,7 @@ endif()
 
 option(USE_SHARED_ENET "Use shared libenet if found rather than Dolphin's soon-to-compatibly-diverge version" OFF)
 option(USE_UPNP "Enables UPnP port mapping support" ON)
-option(USE_SHARED_PUGI "Use shared pugixml" ON)
+option(USE_SHARED_PUGIXML "Use shared pugixml" ON)
 option(USE_SHARED_SFML "Use shared SFML" ON)
 option(ENABLE_NOGUI "Enable NoGUI frontend" ON)
 option(ENABLE_QT "Enable Qt (Default)" ON)
@@ -600,11 +600,10 @@ if(NOT WIN32 OR (NOT (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")))
   add_definitions(-DHAS_OPENGL)
 endif()
 
-if (USE_SHARED_PUGI)
+if (USE_SHARED_PUGIXML)
   find_package(pugixml)
   message(STATUS "Using shared pugixml")
 else()
-  # Compiling with Clang needs to use external pugixml library
   check_vendoring_approved(pugixml)
   message(STATUS "Using static pugixml from Externals")
   add_subdirectory(Externals/pugixml)
@@ -766,8 +765,6 @@ if(NOT ANDROID)
   endif()
   set(LIBUSB_FOUND true)
 endif()
-
-
 
 set(SFML_REQD_VERSION 2.1)
 if(USE_SHARED_SFML)
