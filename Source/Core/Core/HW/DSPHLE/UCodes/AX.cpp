@@ -32,11 +32,6 @@ AXUCode::AXUCode(DSPHLE* dsphle, u32 crc) : UCodeInterface(dsphle, crc)
   INFO_LOG_FMT(DSPHLE, "Instantiating AXUCode: crc={:08x}", crc);
 }
 
-AXUCode::~AXUCode()
-{
-  m_mail_handler.Clear();
-}
-
 void AXUCode::Initialize()
 {
   m_mail_handler.PushMail(DSP_INIT, true);
@@ -243,13 +238,13 @@ void AXUCode::HandleCommandList()
       break;
     }
 
-    // Send the contents of MAIN LRS, AUXA LRS and AUXB S to RAM, and
+    // Send the contents of AUXA LRS and AUXB S to RAM, and
     // mix data to MAIN LR and AUXB LR.
     case CMD_SEND_AUX_AND_MIX:
     {
-      // Address for Main + AUXA LRS upload
-      u16 main_auxa_up_hi = m_cmdlist[curr_idx++];
-      u16 main_auxa_up_lo = m_cmdlist[curr_idx++];
+      // Address for AUXA LRS upload
+      u16 auxa_lrs_up_hi = m_cmdlist[curr_idx++];
+      u16 auxa_lrs_up_lo = m_cmdlist[curr_idx++];
 
       // Address for AUXB S upload
       u16 auxb_s_up_hi = m_cmdlist[curr_idx++];
@@ -271,7 +266,7 @@ void AXUCode::HandleCommandList()
       u16 auxb_r_dl_hi = m_cmdlist[curr_idx++];
       u16 auxb_r_dl_lo = m_cmdlist[curr_idx++];
 
-      SendAUXAndMix(HILO_TO_32(main_auxa_up), HILO_TO_32(auxb_s_up), HILO_TO_32(main_l_dl),
+      SendAUXAndMix(HILO_TO_32(auxa_lrs_up), HILO_TO_32(auxb_s_up), HILO_TO_32(main_l_dl),
                     HILO_TO_32(main_r_dl), HILO_TO_32(auxb_l_dl), HILO_TO_32(auxb_r_dl));
       break;
     }
@@ -364,37 +359,18 @@ AXMixControl AXUCode::ConvertMixerControl(u32 mixer_control)
 
 void AXUCode::SetupProcessing(u32 init_addr)
 {
-  u16 init_data[0x20];
-
-  for (u32 i = 0; i < 0x20; ++i)
-    init_data[i] = HLEMemory_Read_U16(init_addr + 2 * i);
-
-  // List of all buffers we have to initialize
-  int* buffers[] = {m_samples_main_left, m_samples_main_right, m_samples_main_surround,
-                    m_samples_auxA_left, m_samples_auxA_right, m_samples_auxA_surround,
-                    m_samples_auxB_left, m_samples_auxB_right, m_samples_auxB_surround};
-
-  u32 init_idx = 0;
-  for (auto& buffer : buffers)
-  {
-    s32 init_val = (s32)((init_data[init_idx] << 16) | init_data[init_idx + 1]);
-    s16 delta = (s16)init_data[init_idx + 2];
-
-    init_idx += 3;
-
-    if (!init_val)
-    {
-      memset(buffer, 0, 5 * 32 * sizeof(int));
-    }
-    else
-    {
-      for (u32 j = 0; j < 32 * 5; ++j)
-      {
-        buffer[j] = init_val;
-        init_val += delta;
-      }
-    }
-  }
+  const std::array<BufferDesc, 9> buffers = {{
+      {m_samples_main_left, 32},
+      {m_samples_main_right, 32},
+      {m_samples_main_surround, 32},
+      {m_samples_auxA_left, 32},
+      {m_samples_auxA_right, 32},
+      {m_samples_auxA_surround, 32},
+      {m_samples_auxB_left, 32},
+      {m_samples_auxB_right, 32},
+      {m_samples_auxB_surround, 32},
+  }};
+  InitMixingBuffers<5 /*ms*/>(init_addr, buffers);
 }
 
 void AXUCode::DownloadAndMixWithVolume(u32 addr, u16 vol_main, u16 vol_auxa, u16 vol_auxb)
@@ -629,7 +605,7 @@ void AXUCode::SetOppositeLR(u32 src_addr)
   }
 }
 
-void AXUCode::SendAUXAndMix(u32 main_auxa_up, u32 auxb_s_up, u32 main_l_dl, u32 main_r_dl,
+void AXUCode::SendAUXAndMix(u32 auxa_lrs_up, u32 auxb_s_up, u32 main_l_dl, u32 main_r_dl,
                             u32 auxb_l_dl, u32 auxb_r_dl)
 {
   // Buffers to upload first
@@ -640,7 +616,7 @@ void AXUCode::SendAUXAndMix(u32 main_auxa_up, u32 auxb_s_up, u32 main_l_dl, u32 
   };
 
   // Upload AUXA LRS
-  int* ptr = (int*)HLEMemory_Get_Pointer(main_auxa_up);
+  int* ptr = (int*)HLEMemory_Get_Pointer(auxa_lrs_up);
   for (const auto& up_buffer : up_buffers)
   {
     for (u32 j = 0; j < 32 * 5; ++j)
@@ -677,53 +653,76 @@ void AXUCode::SendAUXAndMix(u32 main_auxa_up, u32 auxb_s_up, u32 main_l_dl, u32 
 
 void AXUCode::HandleMail(u32 mail)
 {
-  // Indicates if the next message is a command list address.
-  static bool next_is_cmdlist = false;
-  static u16 cmdlist_size = 0;
-
-  bool set_next_is_cmdlist = false;
-
-  if (next_is_cmdlist)
+  if (m_upload_setup_in_progress)
   {
-    CopyCmdList(mail, cmdlist_size);
+    PrepareBootUCode(mail);
+    return;
+  }
+
+  switch (m_mail_state)
+  {
+  case MailState::WaitingForCmdListSize:
+    if ((mail & MAIL_CMDLIST_MASK) == MAIL_CMDLIST)
+    {
+      // A command list address is going to be sent next.
+      m_cmdlist_size = static_cast<u16>(mail & ~MAIL_CMDLIST_MASK);
+      m_mail_state = MailState::WaitingForCmdListAddress;
+    }
+    else
+    {
+      ERROR_LOG_FMT(DSPHLE, "Unknown mail sent to AX::HandleMail; expected command list: {:08x}",
+                    mail);
+    }
+    break;
+
+  case MailState::WaitingForCmdListAddress:
+    CopyCmdList(mail, m_cmdlist_size);
     HandleCommandList();
     m_cmdlist_size = 0;
     SignalWorkEnd();
-  }
-  else if (m_upload_setup_in_progress)
-  {
-    PrepareBootUCode(mail);
-  }
-  else if (mail == MAIL_RESUME)
-  {
-    // Acknowledge the resume request
-    m_mail_handler.PushMail(DSP_RESUME, true);
-  }
-  else if (mail == MAIL_NEW_UCODE)
-  {
-    m_upload_setup_in_progress = true;
-  }
-  else if (mail == MAIL_RESET)
-  {
-    m_dsphle->SetUCode(UCODE_ROM);
-  }
-  else if (mail == MAIL_CONTINUE)
-  {
-    // We don't have to do anything here - the CPU does not wait for a ACK
-    // and sends a cmdlist mail just after.
-  }
-  else if ((mail & MAIL_CMDLIST_MASK) == MAIL_CMDLIST)
-  {
-    // A command list address is going to be sent next.
-    set_next_is_cmdlist = true;
-    cmdlist_size = (u16)(mail & ~MAIL_CMDLIST_MASK);
-  }
-  else
-  {
-    ERROR_LOG_FMT(DSPHLE, "Unknown mail sent to AX::HandleMail: {:08x}", mail);
-  }
+    m_mail_state = MailState::WaitingForNextTask;
+    break;
 
-  next_is_cmdlist = set_next_is_cmdlist;
+  case MailState::WaitingForNextTask:
+    if ((mail & TASK_MAIL_MASK) != TASK_MAIL_TO_DSP)
+    {
+      WARN_LOG_FMT(DSPHLE, "Rendering task without prefix CDD1: {:08x}", mail);
+      mail = TASK_MAIL_TO_DSP | (mail & ~TASK_MAIL_MASK);
+      // The actual uCode does not check for the CDD1 prefix.
+    }
+
+    switch (mail)
+    {
+    case MAIL_RESUME:
+      // Acknowledge the resume request
+      m_mail_handler.PushMail(DSP_RESUME, true);
+      m_mail_state = MailState::WaitingForCmdListSize;
+      break;
+
+    case MAIL_NEW_UCODE:
+      m_upload_setup_in_progress = true;
+      // Relevant when this uCode is resumed after switching.
+      // The resume mail is sent via the NeedsResumeMail() check above
+      // (and the flag corresponding to it is set by PrepareBootUCode).
+      m_mail_state = MailState::WaitingForCmdListSize;
+      break;
+
+    case MAIL_RESET:
+      m_dsphle->SetUCode(UCODE_ROM);
+      break;
+
+    case MAIL_CONTINUE:
+      // We don't have to do anything here - the CPU does not wait for a ACK
+      // and sends a cmdlist mail just after.
+      m_mail_state = MailState::WaitingForCmdListSize;
+      break;
+
+    default:
+      WARN_LOG_FMT(DSPHLE, "Unknown task mail: {:08x}", mail);
+      break;
+    }
+    break;
+  }
 }
 
 void AXUCode::CopyCmdList(u32 addr, u16 size)
@@ -736,7 +735,6 @@ void AXUCode::CopyCmdList(u32 addr, u16 size)
 
   for (u32 i = 0; i < size; ++i, addr += 2)
     m_cmdlist[i] = HLEMemory_Read_U16(addr);
-  m_cmdlist_size = size;
 }
 
 void AXUCode::Update()
@@ -752,6 +750,7 @@ void AXUCode::DoAXState(PointerWrap& p)
 {
   p.Do(m_cmdlist);
   p.Do(m_cmdlist_size);
+  p.Do(m_mail_state);
 
   p.Do(m_samples_main_left);
   p.Do(m_samples_main_right);
@@ -766,15 +765,14 @@ void AXUCode::DoAXState(PointerWrap& p)
   auto old_checksum = m_coeffs_checksum;
   p.Do(m_coeffs_checksum);
 
-  if (p.GetMode() == PointerWrap::MODE_READ && m_coeffs_checksum &&
-      old_checksum != m_coeffs_checksum)
+  if (p.IsReadMode() && m_coeffs_checksum && old_checksum != m_coeffs_checksum)
   {
     if (!LoadResamplingCoefficients(true, *m_coeffs_checksum))
     {
       Core::DisplayMessage("Could not find the DSP polyphase resampling coefficients used by the "
                            "savestate. Aborting load state.",
                            3000);
-      p.SetMode(PointerWrap::MODE_VERIFY);
+      p.SetVerifyMode();
       return;
     }
   }
